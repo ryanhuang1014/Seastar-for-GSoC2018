@@ -5,4 +5,4 @@ build
 build.ninja
 cscope.*
 dpdk
-_pycache__
+__pycache__
