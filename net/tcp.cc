@@ -164,6 +164,21 @@ tcpv4_socket(tcp<ipv4_traits>& tcpv4) {
             tcpv4));
 }
 
+
+}
+
+//ryan add
+boost::program_options::options_description
+get_tcp_net_options_description()
+{
+    boost::program_options::options_description opts(
+            "TCP congestion algorithm options");
+    opts.add_options()
+            ("tcp-congestion",
+             boost::program_options::value<std::string>()->default_value("tcp_bic"),
+             "select the tcp congestion algorithm")
+            ;
+    return opts;
 }
 
 }
