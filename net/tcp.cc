@@ -18,7 +18,6 @@
 /*
  * Copyright (C) 2014 Cloudius Systems, Ltd.
  */
-
 #include "tcp.hh"
 #include "tcp-stack.hh"
 #include "ip.hh"
