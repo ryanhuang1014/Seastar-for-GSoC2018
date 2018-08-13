@@ -171,7 +171,7 @@ get_tcp_congestion_options_description() {
     opts.add_options()
             ("tcp-congestion",
              boost::program_options::value<std::string>()->default_value("tcp_newreno"),
-             "select the tcp congestion algorithm"
+             "select the tcp congestion algorithm (tcp_newreno / tcp_bbr)"
             );
     return opts;
 

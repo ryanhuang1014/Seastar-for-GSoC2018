@@ -28,6 +28,8 @@ In general, the implemention in the Seastar is composed of 3 important component
 
 This component is used to estimation the bottleneck bandwidth which will be used by TCP BBR algorithm to throttle its sending rate. The implementation is developed as TCP-BBR which is described at [https://tools.ietf.org/id/draft-cheng-iccrg-delivery-rate-estimation-00.html](https://tools.ietf.org/id/draft-cheng-iccrg-delivery-rate-estimation-00.html).
 
+We can easily validate our pacing system by running our program on a link with capacity of 10Mbps, i.e., (1.25MB/s), and observe the estimation change.
+
 ### The state and model transition algorithm
 
 This component is just developed as the instruction of TCP-BBR:
@@ -52,18 +54,18 @@ This component is just developed as the instruction of TCP-BBR:
 
 ### The packet pacing system
 
-This component is responsible to limit sending rate to the estimated bottleneck bandwidth as TCP BBR. We develop a classic token bucket to pacing overspeed packets. In our implemantation, we use the function `try_output()` to control the time when the system calls the `output()` to send packets, and the frequecy is controlled by the token bucket. The rate of the token bucket increasing its token is determined by the bottleneck bandwidth.
+This component is responsible to limit sending rate to the estimated bottleneck bandwidth as TCP BBR. We bypass all the original `output()` function, and instead of sending a packet inmmediately, we use a timer to pace all packets to the bottleneck bandwidth, and a `time_out()` function is triggered to call `output()` function to send packets as the bottleneck bandwidth.
 
-We can easily validate our pacing system by limit the token increasing rate to be a fixed number, e.g., 12000000 (12MB/s), and observe the downloading rate.
+We can easily validate our pacing system by directly limit the pacing rate to be a fixed number, e.g., 8Mbps (1MB/s), and observe the downloading rate.
 
-![rate-limiting](token_bucket_rate_limiting.PNG)
+![rate-limiting](new-packet-pacing.PNG)
 
 
 
 
 ## Reproducing the results 
 
-We can observe the long-term performance of TCP BBR just by fetching a large video, which makes the transmission last long enough. In our exprimentaion, a 1.3GB video file is placed under the home directory.
+We can observe the long-term performance of TCP BBR just by fetching a large video, which makes the transmission last long enough. In our exprimentaion, a 1.3GB video file is placed under the home directory. We just use the same environment as what in BBR pacper, i.e., a link with capacity of 10Mbps, delay of 40ms. 
 
 1. use the Seastar as a http server, and run `sudo build/release/apps/httpd/httpd --network-stack native --dpdk-pmd --dhcp 0 --host-ipv4-addr 192.168.11.1 --netmask-ipv4-addr 255.255.255.0 --port 80 --collectd 0 --smp 2 -m 2G --lro on --tso on --tcp-congestion tcp_bbr ` 
 
