@@ -43,6 +43,8 @@
 #include <stdexcept>
 #include <system_error>
 
+#include <fstream>
+#include <iostream>
 #define CRYPTOPP_ENABLE_NAMESPACE_WEAK 1
 #include <cryptopp/md5.h>
 
@@ -289,9 +291,24 @@ struct tcp_hdr {
 struct tcp_tag {};
 using tcp_packet_merger = packet_merger<tcp_seq, tcp_tag>;
 
+
+//ryan add:
+boost::program_options::options_description get_tcp_congestion_options_description();
+
+//ryan add: enum tcp congestion
+enum class tcp_congestion : uint16_t {
+    TCP_NEWRENO  =  (1  <<  0),
+    TCP_BBR  =  (1  <<  1)
+};
+
 template <typename InetTraits>
 class tcp {
 public:
+    // ryan add: configure the command line to configure tcp congestion control mechanism
+    void tcp_configure(boost::program_options::variables_map configuration);
+    tcp_congestion _tcp_congestion;
+
+
     using ipaddr = typename InetTraits::address_type;
     using inet_type = typename InetTraits::inet_type;
     using connid = l4connid<InetTraits>;
@@ -327,6 +344,13 @@ private:
             uint16_t data_len;
             unsigned nr_transmits;
             clock_type::time_point tx_time;
+            bool app_limit;  // Ryan:
+            std::chrono::high_resolution_clock::time_point high_tx_time;
+            std::chrono::high_resolution_clock::time_point p_ack_time;
+            uint64_t p_delivered_bytes;
+            std::chrono::high_resolution_clock::time_point p_send_time;
+            std::chrono::high_resolution_clock::time_point p_first_send_time;
+            uint64_t send_rate;
         };
         struct send {
             tcp_seq unacknowledged;
@@ -346,7 +370,7 @@ private:
             // Wait for all data are acked
             std::experimental::optional<promise<>> _all_data_acked_promise;
             // Limit number of data queued into send queue
-            size_t max_queue_space = 212992;
+            size_t max_queue_space = 21299200;
             size_t current_queue_space = 0;
             // wait for there is at least one byte available in the queue
             std::experimental::optional<promise<>> _send_available_promise;
@@ -354,7 +378,11 @@ private:
             std::chrono::milliseconds rttvar;
             // Smoothed round-trip time
             std::chrono::milliseconds srtt;
+            // Ryan: Smoothed round-trip time
+            std::chrono::microseconds high_srtt;
             bool first_rto_sample = true;
+            // Ryan
+            bool first_high_rtt_sample = true;
             clock_type::time_point syn_tx_time;
             // Congestion window
             uint32_t cwnd;
@@ -388,6 +416,7 @@ private:
         } _rcv;
         tcp_option _option;
         timer<lowres_clock> _delayed_ack;
+        // _rto:1s, _persist_time_out:1s, _rto_min: 1s, _rto_max: 60s
         // Retransmission timeout
         std::chrono::milliseconds _rto{1000};
         std::chrono::milliseconds _persist_time_out{1000};
@@ -444,6 +473,7 @@ private:
             _tcp._tcbs.erase(id);
         }
         std::experimental::optional<typename InetTraits::l4packet> get_packet();
+
         void output() {
             if (!_poll_active) {
                 _poll_active = true;
@@ -481,7 +511,7 @@ private:
         void retransmit_one() {
             bool data_retransmit = true;
             output_one(data_retransmit);
-        }
+        };
         void start_retransmit_timer() {
             auto now = clock_type::now();
             start_retransmit_timer(now);
@@ -508,6 +538,7 @@ private:
         void retransmit();
         void fast_retransmit();
         void update_rto(clock_type::time_point tx_time);
+        void update_high_rtt(std::chrono::high_resolution_clock::time_point high_tx_time); //Ryan
         void update_cwnd(uint32_t acked_bytes);
         void cleanup();
         uint32_t can_send() {
@@ -530,7 +561,9 @@ private:
             auto x = std::min(_snd.window - window_used, _snd.unsent_len);
 
             // Can not send more than congestion window allows
-            x = std::min(_snd.cwnd, x);
+//            x = std::min(_snd.cwnd, x);
+            x = std::min<uint32_t>(std::max(static_cast<int>(_snd.cwnd - flight_size()), 0), x);
+
             if (_snd.dupacks == 1 || _snd.dupacks == 2) {
                 // RFC5681 Step 3.1
                 // Send cwnd + 2 * smss per RFC3042
@@ -543,6 +576,7 @@ private:
                 // Sent 1 full-sized segment at most
                 x = std::min(uint32_t(_snd.mss), x);
             }
+
             return x;
         }
         uint32_t flight_size() {
@@ -651,6 +685,156 @@ private:
         bool segment_acceptable(tcp_seq seg_seq, unsigned seg_len);
         void init_from_options(tcp_hdr* th, uint8_t* opt_start, uint8_t* opt_end);
         friend class connection;
+
+        // ryan add: tcp bbr code block
+        /* Here is a state transition diagram for BBR
+        *             |
+        *             V
+        *    +---> STARTUP  ----+
+        *    |        |         |
+        *    |        V         |
+        *    |      DRAIN   ----+
+        *    |        |         |
+        *    |        V         |
+        *    +---> PROBE_BW ----+
+        *    |      ^    |      |
+        *    |      |    |      |
+        *    |      +----+      |
+        *    |                  |
+        *    +---- PROBE_RTT <--+
+        *
+        */
+
+
+        enum class tcp_bbr_state : uint8_t {
+            BBR_STARTUP        = (1 << 0),
+            BBR_DRAIN          = (1 << 1),
+            BBR_PROBE_BW       = (1 << 2),
+            BBR_PROBE_RTT      = (1 << 3)
+        };
+
+        tcp_bbr_state _bbr_state;
+        //constants for tcp bbr
+        // the maximum counts for probe_bw state (in rounds)
+        static constexpr uint8_t BBR_PROBE_BW_CNT = 10;
+
+        // the minimum interval time for entering probe_rtt (in seconds)
+        static constexpr std::chrono::seconds BBR_INV_PROBE_RTT_LEN{10};
+        // the minimum time for staying in probe_rtt state
+        static constexpr std::chrono::milliseconds BBR_MIN_PROBE_RTT_LEN{200};
+
+        // the slope for inflating cwnd to test whether can grab additional bw
+        static constexpr double BBR_GROWTH_SLOPE = 1.25;
+        // the threshold for testing whether achieving full pipe
+        static constexpr uint8_t BBR_FULL_PIPE_CNT = 3;
+        // the minimum cwnd for probe_rtt state (in bytes, 4 full length packets)
+        static constexpr uint16_t BBR_MIN_CWND_PROBE_RTT = 4 * 1500;
+        // the cwnd gain used in startup state
+        static constexpr double BBR_HIGH_GAIN = 2.885;
+        // the cwnd gain used in drain state to drain packet queuing caused in startup state
+        static constexpr double BBR_DRAIN_GAIN = 0.347;
+        // the paragram used to make up the delayed ack in receivers
+        static constexpr uint8_t BBR_MAKE_UP_CWND_GAIN = 2;
+        // the pacing gain array used in probe bw state
+        static constexpr double BBR_PACING_GAIN[] = {
+                1.25, 0.75,
+                1, 1, 1, 1, 1, 1
+        };
+        // static cycle phase length
+        static constexpr uint8_t CYCLE_PHASE_LEN = 8;
+        // uniform distribution to select a random cycle phase
+        std::uniform_int_distribution<uint8_t> _cycle_dist{0, 7};
+        // signal showing achieving full pipe
+        bool is_full_pipe;
+        // signal showing ready to enter probe_rtt state
+        bool is_ready_enter_probe_rtt;
+
+        // two major variables to maintain bottleneck_bw (in bytes/s) and propagation rtt (in us)
+        uint64_t btl_bw;
+        std::chrono::microseconds prop_rtt;
+
+        //timestamps for different events
+        std::chrono::high_resolution_clock::time_point cycle_stamp;
+        std::chrono::high_resolution_clock::time_point prop_rtt_stamp;
+        std::chrono::high_resolution_clock::time_point expired_probe_rtt_stamp;
+        std::chrono::high_resolution_clock::time_point probe_rtt_done_stamp;
+
+        // compare counts with bw threshold to determine updating btl_bw
+        uint8_t btl_bw_cnt;
+        // compare this count with full bw threshold to dertermine achieve full pipe
+        uint8_t full_pipe_cnt;
+        //gains for bbr
+        double pacing_gain;
+        double cwnd_gain;
+        uint32_t send_quantum;
+        //pacing rate
+        uint64_t pacing_rate;
+        uint64_t last_btl_bw;
+
+        //cycle index to specify one pacing_gain from BBR_PACING_GAIN array
+        uint8_t cycle_index;
+        // store prior btl_bw to compare current btl_bw with target_cwnd
+        uint64_t prior_btl_bw;
+        uint32_t prior_cwnd;
+        std::chrono::high_resolution_clock::time_point last_send_time;
+        std::chrono::high_resolution_clock::time_point send_time;
+        bool is_first_ack;
+        bool have_sent_normal_packet;
+
+        // bbr initialization
+        void bbr_init();
+
+        // state transition func
+        void enter_startup();
+        void enter_drain();
+        void enter_probe_bw();
+        void enter_probe_rtt();
+
+        // check state transition condition and proceed state transition
+        void check_full_pipe(uint64_t packet_send_rate);
+        void check_probe_rtt();
+        void check_drain();
+        void check_advance_cycle_phase();
+
+        //cycle phase transition func used in probe bw state
+        void advance_cycle_phase();
+        bool is_next_cycle_phase();
+
+        // save and restore cwnd because of state transition or packet loss
+        void save_cwnd();
+        void restore_cwnd();
+
+        // pacing related func
+        void set_pacing_rate_with_gain(double pacing_gain);
+
+        // cwnd update func
+        void update_btl_bw(uint64_t bw);
+        // rtt update func
+        void update_rtt();
+        // on receiving, set correct cwnd
+        void bbr_set_cwnd(uint32_t acked_bytes);
+
+        //inflate cwnd to test whether reach full pipe
+        uint32_t bbr_in_flight_size(double gain);
+        uint32_t get_target_cwnd();
+        void set_send_quantum();
+
+        // universal interface for updating model and state in a bbr way
+        void bbr_update_model_and_state(uint32_t acked_bytes, double delivery_rate, uint64_t packet_send_rate);
+        // get the length of the next transmit packet, refer to the get_transmit_packet()
+        uint32_t get_the_length_of_next_transmit_packet();
+
+        // pacing block
+        bool is_app_limit;
+        timer<std::chrono::steady_clock> send_timer;
+        void time_out();
+        void rearm_next_time(int size); // rearm the send_timer based on the pacing rate
+
+        // rate estimation block
+        uint64_t total_delivered_bytes;
+        std::chrono::high_resolution_clock::time_point current_ack_time;
+        std::chrono::high_resolution_clock::time_point last_delivered_send_time;
+
     };
     inet_type& _inet;
     std::unordered_map<connid, lw_shared_ptr<tcb>, connid_hash> _tcbs;
@@ -762,6 +946,7 @@ template <typename InetTraits>
 tcp<InetTraits>::tcp(inet_type& inet)
     : _inet(inet)
     , _e(_rd()) {
+
     namespace sm = metrics;
 
     _metrics.add_group("tcp", {
@@ -950,7 +1135,8 @@ tcp<InetTraits>::tcb::tcb(tcp& t, connid id)
     , _delayed_ack([this] { _nr_full_seg_received = 0; output(); })
     , _retransmit([this] { retransmit(); })
     , _persist([this] { persist(); }) {
-}
+    }
+
 
 template <typename InetTraits>
 void tcp<InetTraits>::tcb::respond_with_reset(tcp_hdr* rth) {
@@ -1004,6 +1190,21 @@ void tcp<InetTraits>::respond_with_reset(tcp_hdr* rth, ipaddr local_ip, ipaddr f
 template <typename InetTraits>
 uint32_t tcp<InetTraits>::tcb::data_segment_acked(tcp_seq seg_ack) {
     uint32_t total_acked_bytes = 0;
+
+    //Ryan: delivery rate estimation as: https://tools.ietf.org/id/draft-cheng-iccrg-delivery-rate-estimation-00.html
+    bool is_valid_sample = true;
+    std::chrono::duration<float> send_elapsed, ack_elapsed;
+    float send_elapsed_cnt, ack_elapsed_cnt;
+    double delivery_elapsed_cnt;
+    double delivery_rate;
+    current_ack_time = std::chrono::high_resolution_clock::now();
+    bool is_first_packet = true;
+    uint64_t first_p_delivered_bytes = 0;
+    std::chrono::high_resolution_clock::time_point first_p_ack_time;
+    std::chrono::high_resolution_clock::time_point first_p_send_time;
+    std::chrono::high_resolution_clock::time_point first_p_first_send_time;
+    uint64_t packet_send_rate;
+
     // Full ACK of segment
     while (!_snd.data.empty()
             && (_snd.unacknowledged + _snd.data.front().p.len() <= seg_ack)) {
@@ -1012,13 +1213,42 @@ uint32_t tcp<InetTraits>::tcb::data_segment_acked(tcp_seq seg_ack) {
         // Ignore retransmitted segments when setting the RTO
         if (_snd.data.front().nr_transmits == 0) {
             update_rto(_snd.data.front().tx_time);
+            // Ryan:
+            update_high_rtt(_snd.data.front().high_tx_time);
         }
-        update_cwnd(acked_bytes);
+
+        //Ryan add
+        if (this->_tcp._tcp_congestion == tcp_congestion::TCP_NEWRENO) {
+            update_cwnd(acked_bytes);
+        }
+
+        if (is_valid_sample && _snd.data.front().app_limit) {
+            is_valid_sample  = false;
+        }
+
+        if (is_first_packet) {
+            first_p_delivered_bytes = _snd.data.front().p_delivered_bytes;
+            first_p_ack_time = _snd.data.front().p_ack_time;
+            first_p_send_time = _snd.data.front().p_send_time;
+            first_p_first_send_time = _snd.data.front().p_first_send_time;
+            is_first_packet = false;
+            packet_send_rate = _snd.data.front().send_rate;
+        }
+
+        if (have_sent_normal_packet) {
+            last_delivered_send_time = _snd.data.front().p_send_time;
+        } else {
+            last_delivered_send_time = std::chrono::high_resolution_clock::now();
+        }
+
         total_acked_bytes += acked_bytes;
         _snd.current_queue_space -= _snd.data.front().data_len;
         signal_send_available();
         _snd.data.pop_front();
+
     }
+
+
     // Partial ACK of segment
     if (_snd.unacknowledged < seg_ack) {
         auto acked_bytes = seg_ack - _snd.unacknowledged;
@@ -1027,9 +1257,62 @@ uint32_t tcp<InetTraits>::tcb::data_segment_acked(tcp_seq seg_ack) {
             unacked_seg.p.trim_front(acked_bytes);
         }
         _snd.unacknowledged = seg_ack;
-        update_cwnd(acked_bytes);
+
+        //ryan add
+        if (this->_tcp._tcp_congestion == tcp_congestion::TCP_NEWRENO) {
+            update_cwnd(acked_bytes);
+        }
+
+//      now, we do not use the partial ack as a valid sample, the following computation is used to debug
+        is_valid_sample = false;
+        if (is_first_packet) {
+            first_p_delivered_bytes = _snd.data.front().p_delivered_bytes;
+            first_p_ack_time = _snd.data.front().p_ack_time;
+            first_p_send_time = _snd.data.front().p_send_time;
+            first_p_first_send_time = _snd.data.front().p_first_send_time;
+            is_first_packet = false;
+            packet_send_rate = _snd.data.front().send_rate;
+        }
+        if (have_sent_normal_packet) {
+            last_delivered_send_time = _snd.data.front().p_send_time;
+        } else {
+            last_delivered_send_time = std::chrono::high_resolution_clock::now();
+        }
+
         total_acked_bytes += acked_bytes;
     }
+
+    total_delivered_bytes += total_acked_bytes;
+
+    //Ryan:
+    if (this->_tcp._tcp_congestion == tcp_congestion::TCP_BBR) {
+
+        ack_elapsed = current_ack_time - first_p_ack_time;
+        send_elapsed = first_p_send_time - first_p_first_send_time;
+
+        ack_elapsed_cnt = std::max<float>(0, ack_elapsed.count());
+        send_elapsed_cnt = std::max<float>(0, send_elapsed.count());
+
+        if (is_first_ack) {
+            is_first_ack = false;
+            first_p_delivered_bytes = 0;
+            delivery_elapsed_cnt = 1;
+        } else {
+            delivery_elapsed_cnt = std::max(send_elapsed_cnt, ack_elapsed_cnt);
+        }
+
+        if (delivery_elapsed_cnt < std::chrono::duration_cast<std::chrono::duration<double>>(prop_rtt).count()) {
+            is_valid_sample = false;
+        }
+
+        if (is_valid_sample) {
+            delivery_rate = (total_delivered_bytes - first_p_delivered_bytes) / delivery_elapsed_cnt;
+            bbr_update_model_and_state(total_acked_bytes, delivery_rate, packet_send_rate);
+        } else {
+            bbr_update_model_and_state(total_acked_bytes, 0, 0);
+        }
+    }
+
     return total_acked_bytes;
 }
 
@@ -1088,6 +1371,11 @@ void tcp<InetTraits>::tcb::init_from_options(tcp_hdr* th, uint8_t* opt_start, ui
 
     // Setup initial slow start threshold
     _snd.ssthresh = th->window << _snd.window_scale;
+
+    //ryan add:
+    if (_tcp._tcp_congestion == tcp_congestion::TCP_BBR) {
+        bbr_init();
+    }
 }
 
 template <typename InetTraits>
@@ -1307,7 +1595,7 @@ void tcp<InetTraits>::tcb::input_handle_other_state(tcp_hdr* th, packet p) {
         };
         // ESTABLISHED STATE or
         // CLOSE_WAIT STATE: Do the same processing as for the ESTABLISHED state.
-        if (in_state(ESTABLISHED | CLOSE_WAIT)){
+        if (in_state(ESTABLISHED | CLOSE_WAIT)) {
             // When we are in zero window probing phase and packets_out = 0 we bypass "duplicated ack" check
             auto packets_out = _snd.next - _snd.unacknowledged - _snd.zero_window_probing_out;
             // If SND.UNA < SEG.ACK =< SND.NXT then, set SND.UNA <- SEG.ACK.
@@ -1340,8 +1628,15 @@ void tcp<InetTraits>::tcb::input_handle_other_state(tcp_hdr* th, packet p) {
                     uint32_t smss = _snd.mss;
                     if (seg_ack > _snd.recover) {
                         tcp_debug("ack: full_ack\n");
-                        // Set cwnd to min (ssthresh, max(FlightSize, SMSS) + SMSS)
-                        _snd.cwnd = std::min(_snd.ssthresh, std::max(flight_size(), smss) + smss);
+
+                        //ryan add
+                        if (this->_tcp._tcp_congestion == tcp_congestion::TCP_NEWRENO) {
+                            // Set cwnd to min (ssthresh, max(FlightSize, SMSS) + SMSS)
+                            _snd.cwnd = std::min(_snd.ssthresh, std::max(flight_size(), smss) + smss);
+                        } else if (this->_tcp._tcp_congestion == tcp_congestion::TCP_BBR) {
+                            bbr_update_model_and_state(0, 0, 0);
+                        }
+
                         // Exit the fast recovery procedure
                         exit_fast_recovery();
                         set_retransmit_timer();
@@ -1349,14 +1644,22 @@ void tcp<InetTraits>::tcb::input_handle_other_state(tcp_hdr* th, packet p) {
                         tcp_debug("ack: partial_ack\n");
                         // Retransmit the first unacknowledged segment
                         fast_retransmit();
-                        // Deflate the congestion window by the amount of new data
-                        // acknowledged by the Cumulative Acknowledgment field
-                        _snd.cwnd -= acked_bytes;
-                        // If the partial ACK acknowledges at least one SMSS of new
-                        // data, then add back SMSS bytes to the congestion window
-                        if (acked_bytes >= smss) {
-                            _snd.cwnd += smss;
+
+                        //ryan add
+                        if (this->_tcp._tcp_congestion == tcp_congestion::TCP_NEWRENO) {
+                            // Deflate the congestion window by the amount of new data
+                            // acknowledged by the Cumulative Acknowledgment field
+                            _snd.cwnd -= acked_bytes;
+                            // If the partial ACK acknowledges at least one SMSS of new
+                            // data, then add back SMSS bytes to the congestion window
+                            if (acked_bytes >= smss) {
+                                _snd.cwnd += smss;
+                            }
+                        } else if (this->_tcp._tcp_congestion == tcp_congestion::TCP_BBR) {
+                            bbr_update_model_and_state(0, 0, 0);
                         }
+
+
                         // Send a new segment if permitted by the new value of
                         // cwnd.  Do not exit the fast recovery procedure For
                         // the first partial ACK that arrives during fast
@@ -1404,11 +1707,25 @@ void tcp<InetTraits>::tcb::input_handle_other_state(tcp_hdr* th, packet p) {
                     } else {
                         // Do not enter fast retransmit and do not reset ssthresh
                     }
-                    // RFC5681 Step 3.3
-                    _snd.cwnd = _snd.ssthresh + 3 * smss;
+
+                    //ryan add
+                    if (_tcp._tcp_congestion == tcp_congestion::TCP_NEWRENO) {
+                        // RFC5681 Step 3.3
+                        _snd.cwnd = _snd.ssthresh + 3 * smss;
+                    } else if (_tcp._tcp_congestion == tcp_congestion::TCP_BBR) {
+                        bbr_update_model_and_state(0, 0, 0);
+                    }
+
                 } else if (_snd.dupacks > 3) {
-                    // RFC5681 Step 3.4
-                    _snd.cwnd += smss;
+
+                    //ryan add
+                    if (_tcp._tcp_congestion == tcp_congestion::TCP_NEWRENO) {
+                        // RFC5681 Step 3.4
+                        _snd.cwnd += smss;
+                    } else if (_tcp._tcp_congestion == tcp_congestion::TCP_BBR) {
+                        bbr_update_model_and_state(0, 0, 0);
+                    }
+
                     // RFC5681 Step 3.5
                     do_output_data = true;
                 }
@@ -1544,7 +1861,13 @@ void tcp<InetTraits>::tcb::input_handle_other_state(tcp_hdr* th, packet p) {
     if (do_output || (do_output_data && can_send())) {
         // Since we will do output, we can canncel scheduled delayed ACK.
         clear_delayed_ack();
-        output();
+        // ryan: if you reach here, you are in a establish state and every thing goes well until now
+
+        //ryan: for pacing
+        if (this->_tcp._tcp_congestion == tcp_congestion::TCP_NEWRENO) {
+            output();
+        }
+
     }
 }
 
@@ -1563,7 +1886,9 @@ packet tcp<InetTraits>::tcb::get_transmit_packet() {
     } else {
         len = std::min(uint16_t(_tcp.hw_features().mtu - net::tcp_hdr_len_min - InetTraits::ip_hdr_len_min), _snd.mss);
     }
+
     can_send = std::min(can_send, len);
+
     // easy case: one small packet
     if (_snd.unsent.size() == 1 && _snd.unsent.front().len() <= can_send) {
         auto p = std::move(_snd.unsent.front());
@@ -1691,16 +2016,20 @@ void tcp<InetTraits>::tcb::output_one(bool data_retransmit) {
 
     if (!data_retransmit && (len || syn_on || fin_on)) {
         auto now = clock_type::now();
+        auto high_now = std::chrono::high_resolution_clock::now();
         if (len) {
+            have_sent_normal_packet = true;
             unsigned nr_transmits = 0;
             _snd.data.emplace_back(unacked_segment{std::move(clone),
-                                   len, nr_transmits, now});
+                                   len, nr_transmits, now, is_app_limit, high_now,
+                                   current_ack_time, total_delivered_bytes,
+                                   high_now, last_delivered_send_time, last_btl_bw});
+            is_app_limit = (_snd.unsent.empty() || _bbr_state == tcp_bbr_state::BBR_PROBE_RTT || _bbr_state == tcp_bbr_state::BBR_DRAIN);
         }
         if (!_retransmit.armed()) {
             start_retransmit_timer(now);
         }
     }
-
 
     // if advertised TCP receive window is 0 we may only transmit zero window probing segment.
     // Payload size of this segment is 1. Queueing anything bigger when _snd.window == 0 is bug
@@ -1787,7 +2116,10 @@ future<> tcp<InetTraits>::tcb::send(packet p) {
     _snd.unsent.push_back(std::move(p));
 
     if (can_send() > 0) {
-        output();
+        if (this->_tcp._tcp_congestion == tcp_congestion::TCP_NEWRENO) {
+            output();
+        }
+
     }
 
     return wait_send_available();
@@ -1962,8 +2294,15 @@ void tcp<InetTraits>::tcb::retransmit() {
     }
     // RFC6582 Step 4
     _snd.recover = _snd.next - 1;
-    // Start the slow start process
-    _snd.cwnd = smss;
+
+    //ryan add
+    if (_tcp._tcp_congestion == tcp_congestion::TCP_NEWRENO) {
+        // Start the slow start process
+        _snd.cwnd = smss;
+    } else if (_tcp._tcp_congestion == tcp_congestion::TCP_BBR) {
+        bbr_update_model_and_state(0, 0, 0);
+    }
+
     // End fast recovery
     exit_fast_recovery();
 
@@ -2013,6 +2352,18 @@ void tcp<InetTraits>::tcb::update_rto(clock_type::time_point tx_time) {
     // Make sure 1 sec << _rto << 60 sec
     _rto = std::max(_rto, _rto_min);
     _rto = std::min(_rto, _rto_max);
+}
+
+// Ryan
+template <typename InetTraits>
+void tcp<InetTraits>::tcb::update_high_rtt(std::chrono::high_resolution_clock::time_point high_tx_time) {
+    auto R = std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::high_resolution_clock::now() - high_tx_time);
+    if (_snd.first_high_rtt_sample) {
+        _snd.first_high_rtt_sample = false;
+        _snd.high_srtt = R;
+    } else {
+        _snd.high_srtt = _snd.high_srtt * 1 / 2 +  R / 2;
+    }
 }
 
 template <typename InetTraits>
@@ -2079,7 +2430,12 @@ std::experimental::optional<typename InetTraits::l4packet> tcp<InetTraits>::tcb:
         // more add tcp back to polling set to keep sending. In addition, dupacks >= 3
         // is an indication that an segment is lost, stop sending more in this case.
         // Finally - we can't send more until window is opened again.
-        output();
+
+        //ryan: for pacing
+        if (this->_tcp._tcp_congestion == tcp_congestion::TCP_NEWRENO) {
+            output();
+        }
+
     }
     return std::move(p);
 }
@@ -2104,6 +2460,339 @@ void tcp<InetTraits>::connection::shutdown_connect() {
         close_write();
     }
 }
+
+//ryan add
+template <typename InetTraits>
+void tcp<InetTraits>::tcp_configure(boost::program_options::variables_map configuration) {
+    std::string tcp_var = configuration["tcp-congestion"].as<std::string>();
+    if (tcp_var == "tcp_newreno") {
+        this->_tcp_congestion = tcp_congestion ::TCP_NEWRENO;
+    } else if (tcp_var == "tcp_bbr") {
+        this->_tcp_congestion = tcp_congestion ::TCP_BBR;
+    }
+}
+
+
+template <typename InetTraits>
+void tcp<InetTraits>::tcb::enter_probe_bw() {
+    _bbr_state = tcp_bbr_state::BBR_PROBE_BW;
+    pacing_gain = 1;
+    cwnd_gain = 2;
+    cycle_index = _cycle_dist(_tcp._e);
+    advance_cycle_phase();
+}
+
+
+template <typename InetTraits>
+void tcp<InetTraits>::tcb::enter_probe_rtt() {
+    _bbr_state = tcp_bbr_state::BBR_PROBE_RTT;
+    pacing_gain = 1;
+    cwnd_gain = 1;
+}
+
+template <typename InetTraits>
+void tcp<InetTraits>::tcb::enter_startup() {
+    _bbr_state = tcp_bbr_state::BBR_STARTUP;
+    pacing_gain = BBR_HIGH_GAIN;
+    cwnd_gain = BBR_HIGH_GAIN;
+}
+
+template <typename InetTraits>
+void tcp<InetTraits>::tcb::enter_drain() {
+    _bbr_state = tcp_bbr_state::BBR_DRAIN;
+    pacing_gain = BBR_DRAIN_GAIN;
+    cwnd_gain = BBR_HIGH_GAIN;
+}
+
+template <typename InetTraits>
+void tcp<InetTraits>::tcb::check_full_pipe(uint64_t packet_send_rate) {
+    if (is_full_pipe) {
+        return;
+    }
+
+//    uint64_t target_bw = static_cast<uint64_t>(prior_btl_bw * BBR_GROWTH_SLOPE);
+    uint64_t target_bw = static_cast<uint64_t>(packet_send_rate * BBR_GROWTH_SLOPE);
+    if (btl_bw >= target_bw) {
+        is_full_pipe = false;
+        full_pipe_cnt = 0;
+    } else {
+        full_pipe_cnt++;
+    }
+    if (full_pipe_cnt > BBR_FULL_PIPE_CNT) {
+        is_full_pipe = true;
+    }
+}
+
+template <typename InetTraits>
+void tcp<InetTraits>::tcb::check_drain() {
+    if (_bbr_state == tcp_bbr_state::BBR_STARTUP && is_full_pipe) {
+        enter_drain();
+    }
+    if (_bbr_state == tcp_bbr_state::BBR_DRAIN && flight_size() < bbr_in_flight_size(1.0)) {
+        enter_probe_bw();
+    }
+}
+
+template <typename InetTraits>
+void tcp<InetTraits>::tcb::check_probe_rtt() {
+    auto now = std::chrono::high_resolution_clock::now();
+    if (_bbr_state != tcp_bbr_state::BBR_PROBE_RTT && (now > expired_probe_rtt_stamp)) {
+        enter_probe_rtt();
+        save_cwnd();
+        is_ready_enter_probe_rtt = true;
+    }
+    if (_bbr_state == tcp_bbr_state::BBR_PROBE_RTT) {
+        if (flight_size() <= BBR_MIN_CWND_PROBE_RTT && (is_ready_enter_probe_rtt)) {
+            probe_rtt_done_stamp = now + BBR_MIN_PROBE_RTT_LEN;
+            is_ready_enter_probe_rtt = false;
+        } else if (!is_ready_enter_probe_rtt) {
+            if (now > probe_rtt_done_stamp) {
+                restore_cwnd();
+                if (is_full_pipe) {
+                    enter_probe_bw();
+                } else {
+                    enter_startup();
+                }
+            }
+        }
+    }
+}
+
+template <typename InetTraits>
+void tcp<InetTraits>::tcb::check_advance_cycle_phase() {
+    if (_bbr_state == tcp_bbr_state::BBR_PROBE_BW && is_next_cycle_phase()) {
+        advance_cycle_phase();
+    }
+}
+
+template <typename InetTraits>
+bool tcp<InetTraits>::tcb::is_next_cycle_phase() {
+    bool is_full_cycle_phase = std::chrono::high_resolution_clock::now() > (cycle_stamp + prop_rtt);
+    if (pacing_gain == 1) {
+        return is_full_cycle_phase;
+    }else if (pacing_gain < 1) {
+        return is_full_cycle_phase || flight_size() < bbr_in_flight_size(1);
+    }else{
+        return is_full_cycle_phase && flight_size() > bbr_in_flight_size(pacing_gain);
+    }
+}
+
+template <typename InetTraits>
+void tcp<InetTraits>::tcb::advance_cycle_phase() {
+    cycle_stamp = std::chrono::high_resolution_clock::now();
+    cycle_index = (cycle_index + 1) % CYCLE_PHASE_LEN;
+    pacing_gain = BBR_PACING_GAIN[cycle_index];
+}
+
+template <typename InetTraits>
+uint32_t tcp<InetTraits>::tcb::bbr_in_flight_size(double gain) {
+    // convert a prop_rtt to a float duration
+    auto prop_rtt_s = std::chrono::duration_cast<std::chrono::duration<double>>(prop_rtt);
+    // in bytes
+    uint32_t estimated_bdp = static_cast<uint32_t>(btl_bw * prop_rtt_s.count());
+    uint32_t quantum = 3 * send_quantum;
+    return static_cast<uint32_t>(estimated_bdp * gain + quantum);
+
+}
+
+template <typename InetTraits>
+uint32_t tcp<InetTraits>::tcb::get_target_cwnd() {
+    return bbr_in_flight_size(cwnd_gain);
+}
+
+template <typename InetTraits>
+void tcp<InetTraits>::tcb::set_send_quantum() {
+    if (pacing_rate < 150000) {
+        send_quantum = 1500;
+    } else if (pacing_rate < 3000000) {
+        send_quantum = 3000;
+    } else {
+        send_quantum = std::min<uint32_t>(static_cast<uint32_t>(pacing_rate * 0.01), 64000);
+    }
+}
+
+template <typename InetTraits>
+void tcp<InetTraits>::tcb::save_cwnd() {
+    if (_bbr_state != tcp_bbr_state::BBR_PROBE_RTT) {
+        prior_cwnd = _snd.cwnd;
+    }else{
+        prior_cwnd = std::max(prior_cwnd , _snd.cwnd);
+    }
+}
+
+template <typename InetTraits>
+void tcp<InetTraits>::tcb::restore_cwnd() {
+    _snd.cwnd = prior_cwnd;
+}
+
+template <typename InetTraits>
+void tcp<InetTraits>::tcb::update_btl_bw(uint64_t bw) {
+    if((bw > 0) && ((bw >= btl_bw) || (btl_bw_cnt > BBR_PROBE_BW_CNT) || (btl_bw <= 0))) {
+        prior_btl_bw = btl_bw;
+        btl_bw = bw;
+        btl_bw_cnt = 0;
+    } else if (bw < btl_bw) {
+        btl_bw_cnt++;
+    }
+}
+
+template <typename InetTraits>
+void tcp<InetTraits>::tcb::update_rtt() {
+    auto now = std::chrono::high_resolution_clock::now();
+    expired_probe_rtt_stamp = prop_rtt_stamp + BBR_INV_PROBE_RTT_LEN;
+    if((_snd.high_srtt.count() > 0) && ((prop_rtt.count() == 0) || (_snd.high_srtt < prop_rtt) || (now > expired_probe_rtt_stamp))) {
+        prop_rtt_stamp = now;
+        prop_rtt = _snd.high_srtt;
+    }
+}
+
+// we deal with packet recovery and loss here
+template <typename InetTraits>
+void tcp<InetTraits>::tcb::bbr_set_cwnd(uint32_t acked_bytes) {
+    uint32_t target_cwnd = get_target_cwnd();
+    bool is_packet_conservation = (((_snd.dupacks == 1) || (_snd.dupacks == 2)) && acked_bytes);
+
+    // TODO: deal the timeout loss, and add timeout loss in different ways
+    bool is_packet_loss = (_snd.dupacks >= 3) || (!acked_bytes);
+    // a way to infer the number of lost packets
+    uint32_t packet_loss = std::max( _snd.next - _snd.unacknowledged, 1);
+
+    if (is_packet_conservation) {
+        _snd.cwnd = std::max<uint32_t>(_snd.cwnd, flight_size() + acked_bytes);
+    }else if (is_packet_loss) {
+        _snd.cwnd = std::max<uint32_t>(_snd.cwnd - packet_loss, _snd.mss);
+    }else {
+        // if we are below target cwnd, slow start cwnd towards target cwnd
+        // only cut cwnd if we filled the pipe
+        if (is_full_pipe) {
+            _snd.cwnd = std::min((_snd.cwnd + acked_bytes) , target_cwnd);
+        }else if (_snd.cwnd < target_cwnd) {
+            _snd.cwnd = _snd.cwnd + acked_bytes;
+        }
+        _snd.cwnd = std::max<uint32_t>(_snd.cwnd, BBR_MIN_CWND_PROBE_RTT);
+
+    }
+
+    if (_bbr_state == tcp_bbr_state::BBR_PROBE_RTT) {
+        _snd.cwnd = std::min<uint32_t>(_snd.cwnd, BBR_MIN_CWND_PROBE_RTT);
+    }
+
+
+}
+
+
+// the bbr control entrance
+template <typename InetTraits>
+void tcp<InetTraits>::tcb::bbr_update_model_and_state(uint32_t acked_bytes, double delivery_rate, uint64_t packet_send_rate) {
+    if (acked_bytes) {
+        // in bytes per second
+        if (delivery_rate) {
+            update_btl_bw(static_cast<uint64_t>(delivery_rate));
+        }
+        check_advance_cycle_phase();
+        if (packet_send_rate) {
+            check_full_pipe(packet_send_rate);
+        }
+        check_drain();
+        update_rtt();
+        check_probe_rtt();
+        set_pacing_rate_with_gain(pacing_gain);
+        set_send_quantum();
+    }
+
+    bbr_set_cwnd(acked_bytes);
+}
+
+template <typename InetTraits>
+void tcp<InetTraits>::tcb::set_pacing_rate_with_gain(double pacing_gain) {
+    uint64_t rate = static_cast<uint64_t>(pacing_gain * btl_bw);
+    if (is_full_pipe || rate > pacing_rate) {
+        pacing_rate = rate;
+    }
+}
+
+template <typename InetTraits>
+void tcp<InetTraits>::tcb::bbr_init() {
+    is_full_pipe = false;
+    is_ready_enter_probe_rtt = false;
+    btl_bw = 1000;
+    last_btl_bw = 1000;
+    prop_rtt = std::chrono::microseconds::zero();
+    cycle_stamp = std::chrono::high_resolution_clock::now();
+    prop_rtt_stamp = std::chrono::high_resolution_clock::now();
+    expired_probe_rtt_stamp = std::chrono::high_resolution_clock::now();
+    probe_rtt_done_stamp = std::chrono::high_resolution_clock::now();
+    btl_bw_cnt = 0;
+    full_pipe_cnt = 0;
+    pacing_gain = 0;
+    cwnd_gain = 0;
+    pacing_rate = 1000;
+    cycle_index = 0;
+    prior_btl_bw = 0;
+    prior_cwnd = 0;
+    current_ack_time = std::chrono::high_resolution_clock::now();
+    total_delivered_bytes = 0;
+    last_send_time = std::chrono::high_resolution_clock::now();
+    is_first_ack = true;
+    have_sent_normal_packet = false;
+    is_app_limit = false;
+    rearm_next_time(1);
+    send_timer.set_callback([this] {time_out();});
+    enter_startup();
+}
+
+template <typename InetTraits>
+uint32_t tcp<InetTraits>::tcb::get_the_length_of_next_transmit_packet() {
+    if (_snd.unsent.empty()) {
+        return 0;
+    }
+    auto can_send = this->can_send();
+    // Max number of TCP payloads we can pass to NIC
+    uint32_t len;
+    if (_tcp.hw_features().tx_tso) {
+        // FIXME: Info tap device the size of the splitted packet
+        len = _tcp.hw_features().max_packet_len - net::tcp_hdr_len_min - InetTraits::ip_hdr_len_min;
+    } else {
+        len = std::min(uint16_t(_tcp.hw_features().mtu - net::tcp_hdr_len_min - InetTraits::ip_hdr_len_min), _snd.mss);
+    }
+
+    can_send = std::min(can_send, len);
+
+
+    return  can_send;
+
+}
+
+template <typename InetTraits>
+void tcp<InetTraits>::tcb::rearm_next_time(int size) {
+    auto expired_time = std::chrono::nanoseconds(static_cast<uint64_t>(size) * 1000000000 / pacing_rate);
+    last_btl_bw = btl_bw;
+
+    if (!send_timer.armed()) {
+        send_timer.arm(expired_time);
+    }
+}
+
+template <typename InetTraits>
+void tcp<InetTraits>::tcb::time_out() {
+    auto len = get_the_length_of_next_transmit_packet();
+
+    if (flight_size() < get_target_cwnd()) {
+        if (len) {
+            output();
+        }
+    }
+
+    if (len) {
+        rearm_next_time(len);
+    } else {
+        // wait long enough
+        rearm_next_time(1000);
+    }
+
+}
+
+
 
 template <typename InetTraits>
 constexpr uint16_t tcp<InetTraits>::tcb::_max_nr_retransmit;

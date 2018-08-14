@@ -18,7 +18,6 @@
 /*
  * Copyright (C) 2014 Cloudius Systems, Ltd.
  */
-
 #include "tcp.hh"
 #include "tcp-stack.hh"
 #include "ip.hh"
@@ -163,6 +162,21 @@ tcpv4_socket(tcp<ipv4_traits>& tcpv4) {
     return ::seastar::socket(std::make_unique<native_socket_impl<tcp<ipv4_traits>>>(
             tcpv4));
 }
+
+//ryan add:
+boost::program_options::options_description
+get_tcp_congestion_options_description() {
+    boost::program_options::options_description opts (
+            "TCP congestion algorithm options");
+    opts.add_options()
+            ("tcp-congestion",
+             boost::program_options::value<std::string>()->default_value("tcp_newreno"),
+             "select the tcp congestion algorithm (tcp_newreno / tcp_bbr)"
+            );
+    return opts;
+
+}
+
 
 }
 

@@ -176,6 +176,8 @@ native_network_stack::make_udp_channel(ipv4_addr addr) {
 void
 add_native_net_options_description(boost::program_options::options_description &opts) {
     opts.add(get_virtio_net_options_description());
+    //ryan add : use the original nns registration to integrate the tcp congestion options
+    opts.add(get_tcp_congestion_options_description());
 #ifdef SEASTAR_HAVE_DPDK
     opts.add(get_dpdk_net_options_description());
 #endif
@@ -184,6 +186,8 @@ add_native_net_options_description(boost::program_options::options_description &
 native_network_stack::native_network_stack(boost::program_options::variables_map opts, std::shared_ptr<device> dev)
     : _netif(std::move(dev))
     , _inet(&_netif) {
+    //ryan add: get the tcp congestion options
+    _inet.get_tcp().tcp_configure(opts);
     _inet.get_udp().set_queue_size(opts["udpv4-queue-size"].as<int>());
     _dhcp = opts["host-ipv4-addr"].defaulted()
             && opts["gw-ipv4-addr"].defaulted()
