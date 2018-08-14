@@ -5,7 +5,7 @@ TCP BBR was proposed as a modern TCP congestion control algorithm by Google in 2
 
 TCP BBR is a new variation of TCP algorithm which adjusts its sending rate based on the real-time network metric, i.e, packet round trip time (RTT), the delivered rate (goodput). It is optimal that the amount of traffic walking through a network link is just equal to the well-known bandwidth delay production (BDP). Hence, TCP BBR uses RTT and goodput to constrict the amount of traffic in flight is equal to BDP. In this way, TCP BBR can maximize the goodput, and minimize the RTT at the same time.
 
-In order to use such a modern TCP congestion control algorithm, I start the plan to develop the BBR algorithm in the `Seastar` framework. With my development, now it is possible to use TCP BBR directly from the command line. And according to my test, my implementation works well and I will show it in the rest of this report. 
+In order to use such a modern TCP congestion control algorithm, I start the plan to develop the BBR algorithm in the `Seastar` framework and I just develop my work on this `bbr` branch. With my development, now it is possible to use TCP BBR directly from the command line. And according to my test, my implementation works well and I will show it in the rest of this report. 
 
 
 
